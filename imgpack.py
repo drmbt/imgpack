@@ -19,6 +19,10 @@ import json
 def parse_args():
     parser = argparse.ArgumentParser(description='Create an image gallery from the current directory.')
     parser.add_argument('--no-browser', action='store_true', help='Do not automatically open the gallery in a browser')
+    parser.add_argument('--tabs', nargs='+', help='Create tabs based on patterns (e.g., --tabs lora banny .mp4)')
+    parser.add_argument('--zip', action='store_true', help='Create a ZIP archive of the gallery')
+    parser.add_argument('-r', '--recursive', action='store_true', help='Search recursively in subdirectories')
+    parser.add_argument('--depth', type=int, help='Maximum directory depth to search (default: 1, or unlimited if recursive)')
     return parser.parse_args()
 
 def is_wsl():
@@ -71,6 +75,110 @@ if not all([PHOTOSWIPE_CSS, PHOTOSWIPE_JS, PHOTOSWIPE_LIGHTBOX_JS]):
     PHOTOSWIPE_JS = ""
     PHOTOSWIPE_LIGHTBOX_JS = ""
 
+def matches_pattern(filename, pattern):
+    """Check if filename matches the pattern case-insensitively"""
+    return pattern.lower() in filename.lower()
+
+def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1):
+    """Organize files into tabs based on patterns"""
+    tab_files = {'all': []}  # Always include 'all' tab
+    
+    def process_directory(dir_path, current_depth=1):
+        try:
+            with os.scandir(dir_path) as entries:
+                for entry in entries:
+                    if entry.is_file():
+                        if not is_media_file(entry.name):
+                            continue
+                            
+                        # Add to 'all' tab first
+                        tab_files['all'].append(entry.path)
+                        
+                        # Then check patterns
+                        matched = False
+                        for pattern in patterns:
+                            if matches_pattern(entry.name, pattern):
+                                if pattern not in tab_files:
+                                    tab_files[pattern] = []
+                                tab_files[pattern].append(entry.path)
+                                matched = True
+                        
+                        if not matched:
+                            if 'other' not in tab_files:
+                                tab_files['other'] = []
+                            tab_files['other'].append(entry.path)
+                    
+                    elif entry.is_dir() and (recursive or current_depth < max_depth):
+                        if recursive or current_depth < max_depth:
+                            process_directory(entry.path, current_depth + 1)
+        except PermissionError:
+            print(f"Warning: Permission denied accessing {dir_path}")
+        except Exception as e:
+            print(f"Warning: Error processing {dir_path}: {e}")
+    
+    process_directory(directory)
+    # Only return tabs that have files, but always include 'all'
+    return {k: v for k, v in tab_files.items() if v or k == 'all'}
+
+def generate_gallery_html(directory, tab_name, is_all_tab=False):
+    """Generate HTML for a gallery of media files in the given directory"""
+    html = []
+    
+    files_to_process = []
+    if is_all_tab:
+        # For 'all' tab, look in all subdirectories
+        for subdir in os.scandir(directory):
+            if subdir.is_dir():
+                for file in os.scandir(subdir):
+                    if file.is_file() and is_media_file(file.name):
+                        files_to_process.append((file.name, subdir.name))
+    else:
+        # For other tabs, just look in their directory
+        for file in os.scandir(directory):
+            if file.is_file() and is_media_file(file.name):
+                files_to_process.append((file.name, tab_name))
+    
+    # Sort files by name
+    files_to_process.sort(key=lambda x: x[0])
+    
+    for file_name, source_tab in files_to_process:
+        mime_type, _ = mimetypes.guess_type(file_name)
+        mime_type = mime_type or 'application/octet-stream'
+        media_type = mime_type.split('/')[0]
+        
+        # Use relative path from index.html to the file in the media/tab subdirectory
+        relative_path = f'media/{source_tab}/{file_name}'
+        
+        item_html = f'''
+        <div class="item" data-filename="{file_name}">'''
+            
+        if media_type == 'image':
+            item_html += f'''
+            <a href="{relative_path}" 
+               class="gallery-image"
+               data-pswp-src="{relative_path}">
+                <img src="{relative_path}" alt="{file_name}">
+            </a>'''
+        elif media_type == 'video':
+            item_html += f'''
+            <video controls preload="metadata">
+                <source src="{relative_path}" type="{mime_type}">
+            </video>'''
+        elif media_type == 'audio':
+            item_html += f'''
+            <audio controls preload="metadata">
+                <source src="{relative_path}" type="{mime_type}">
+            </audio>'''
+            
+        item_html += f'''
+            <div class="media-type">{media_type.upper()}</div>
+            <div class="filename-tooltip">{file_name}</div>
+        </div>'''
+        
+        html.append(item_html)
+    
+    return '\n'.join(html)
+
 # HTML template for the gallery
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -87,6 +195,44 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-family: Arial, sans-serif;
             background: #1a1a1a;
             color: #fff;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            position: sticky;
+            top: 0;
+            background: #1a1a1a;
+            padding: 10px 0;
+            z-index: 1000;
+        }
+        
+        .tab {
+            padding: 8px 16px;
+            background: #333;
+            border: none;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .tab:hover {
+            background: #444;
+        }
+        
+        .tab.active {
+            background: #555;
+        }
+        
+        .gallery-container {
+            display: none;
+        }
+        
+        .gallery-container.active {
+            display: block;
         }
         
         .controls {
@@ -137,25 +283,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             width: 150px;
         }
         
-        .controls button {
-            background: #444;
-            border: 1px solid #555;
-            color: #fff;
-            padding: 5px 10px;
-            border-radius: 3px;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        
-        .controls button:hover {
-            background: #555;
-        }
-
-        .controls .selection-info {
-            font-size: 0.9em;
-            color: #aaa;
-        }
-        
         .gallery {
             display: grid;
             gap: 10px;
@@ -174,18 +301,28 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .gallery .item img {
             width: 100%;
             height: auto;
+            min-height: 150px; /* Minimum height to ensure visibility */
             display: block;
             cursor: zoom-in;
             transition: transform 0.2s;
+            object-fit: contain;
         }
         
         .gallery .item video, 
         .gallery .item audio {
             width: 100%;
             height: auto;
+            min-height: 150px; /* Minimum height for videos */
             display: block;
             cursor: pointer;
             transition: transform 0.2s;
+            object-fit: contain;
+        }
+        
+        .gallery .item audio {
+            min-height: 50px; /* Smaller minimum height for audio controls */
+            padding: 30px;
+            box-sizing: border-box;
         }
         
         .gallery .item:hover img,
@@ -203,16 +340,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             border-radius: 3px;
             font-size: 12px;
             z-index: 1;
-        }
-
-        .item-checkbox {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            z-index: 2;
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
         }
 
         .filename-tooltip {
@@ -239,21 +366,52 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .pswp {
             --pswp-bg: #000;
         }
+
+        .search-container {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        
+        .clear-button {
+            background: #444;
+            border: 1px solid #555;
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .clear-button:hover {
+            background: #555;
+        }
     </style>
 </head>
 <body>
-    <div class="controls">
-        <label>
-            Columns: <span id="columns-value">2</span>
-            <input type="range" min="1" max="8" value="2" id="columns">
-        </label>
-        <input type="text" id="search" placeholder="Search files...">
-        <button id="sort-toggle">Sort: Newest First</button>
-        <button id="select-all">Select All</button>
-        <div class="selection-info">Selected: <span id="selected-count">0</span> of <span id="total-count">0</span></div>
+    <div class="tabs">
+        {% for tab in tabs %}
+        <button class="tab" onclick="showTab('{{ tab }}')">{{ tab }} ({{ tab_counts[tab] }})</button>
+        {% endfor %}
     </div>
-
-    <div class="gallery" id="gallery"></div>
+    
+    {% for tab in tabs %}
+    <div id="{{ tab }}-gallery" class="gallery-container {% if loop.first %}active{% endif %}">
+        <div class="controls">
+            <label>
+                Columns: <span id="{{ tab }}-columns-value">2</span>
+                <input type="range" min="1" max="8" value="2" id="{{ tab }}-columns" onchange="updateColumns('{{ tab }}')">
+            </label>
+            <div class="search-container">
+                <input type="text" id="{{ tab }}-search" placeholder="Search files..." onkeyup="filterItems('{{ tab }}')">
+                <button class="clear-button" onclick="clearSearch('{{ tab }}')">Clear</button>
+            </div>
+        </div>
+        <div class="gallery" id="{{ tab }}-grid">
+            {{ galleries[tab] }}
+        </div>
+    </div>
+    {% endfor %}
 
     <!-- PhotoSwipe template -->
     <div class="pswp" tabindex="-1" role="dialog" aria-hidden="true">
@@ -296,197 +454,110 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <script>''' + PHOTOSWIPE_LIGHTBOX_JS + '''</script>
 
     <script>
-        // The file list will be replaced by the Python script
-        const files = [
-/*FILES_PLACEHOLDER*/
-        ];
-
-        function initGallery() {
-            try {
-                console.log('Starting gallery initialization...');
-                
-                // Initialize PhotoSwipe if available
-                if (typeof PhotoSwipe !== 'undefined' && typeof PhotoSwipeLightbox !== 'undefined') {
-                    console.log('PhotoSwipe is available, initializing lightbox...');
-                    const lightbox = new PhotoSwipeLightbox({
-                        gallery: '#gallery',
-                        children: 'a',
-                        pswpModule: PhotoSwipe,
-                        wheelToZoom: true,
-                        padding: { top: 30, bottom: 30, left: 0, right: 0 }
+        function showTab(tabName) {
+            // Hide all galleries
+            document.querySelectorAll('.gallery-container').forEach(container => {
+                container.classList.remove('active');
+            });
+            
+            // Show selected gallery
+            document.getElementById(tabName + '-gallery').classList.add('active');
+            
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelector(`[onclick="showTab('${tabName}')"]`).classList.add('active');
+        }
+        
+        function updateColumns(tabName) {
+            const columnsInput = document.getElementById(tabName + '-columns');
+            const columnsValue = document.getElementById(tabName + '-columns-value');
+            const gallery = document.getElementById(tabName + '-grid');
+            
+            columnsValue.textContent = columnsInput.value;
+            gallery.style.gridTemplateColumns = `repeat(${columnsInput.value}, 1fr)`;
+        }
+        
+        function clearSearch(tabName) {
+            const searchInput = document.getElementById(tabName + '-search');
+            searchInput.value = '';
+            filterItems(tabName);
+        }
+        
+        function filterItems(tabName) {
+            const searchInput = document.getElementById(tabName + '-search');
+            const items = document.querySelectorAll(`#${tabName}-grid .item`);
+            const searchText = searchInput.value.toLowerCase();
+            
+            items.forEach(item => {
+                const filename = item.getAttribute('data-filename').toLowerCase();
+                const tooltip = item.querySelector('.filename-tooltip').textContent.toLowerCase();
+                const mediaType = item.querySelector('.media-type').textContent.toLowerCase();
+                const shouldShow = filename.includes(searchText) || 
+                                 tooltip.includes(searchText) || 
+                                 mediaType.includes(searchText);
+                item.classList.toggle('hidden', !shouldShow);
+            });
+        }
+        
+        // Function to get image dimensions
+        function getImageDimensions(src) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = function() {
+                    resolve({
+                        width: this.naturalWidth,
+                        height: this.naturalHeight
                     });
-                    lightbox.init();
-                    console.log('Lightbox initialized');
-                } else {
-                    console.log('PhotoSwipe not available, using basic gallery');
-                }
+                };
+                img.src = src;
+            });
+        }
 
-                // Handle column changes
-                const columnsSlider = document.getElementById('columns');
-                const columnsValue = document.getElementById('columns-value');
-                const searchInput = document.getElementById('search');
-                const selectAllBtn = document.getElementById('select-all');
-                const selectedCountSpan = document.getElementById('selected-count');
-                const totalCountSpan = document.getElementById('total-count');
+        // Initialize PhotoSwipe
+        document.addEventListener('DOMContentLoaded', () => {
+            const lightbox = new PhotoSwipeLightbox({
+                gallery: '.gallery',
+                children: '.gallery-image',
+                pswpModule: PhotoSwipe,
+                wheelToZoom: true,
+                padding: { top: 30, bottom: 30, left: 0, right: 0 },
+                bgOpacity: 0.9,
+                imageClickAction: 'zoom',
+                tapAction: 'zoom',
+                showHideAnimationType: 'fade'
+            });
+
+            // Set up image dimensions before opening
+            lightbox.on('uiRegister', function() {
+                lightbox.pswp.options.preload = [1, 2];
+            });
+
+            // Handle image loading
+            lightbox.on('beforeOpen', async () => {
+                const items = lightbox.pswp.options.dataSource;
                 
-                columnsSlider.addEventListener('input', function(e) {
-                    const value = e.target.value;
-                    columnsValue.textContent = value;
-                    document.querySelector('.gallery').style.gridTemplateColumns = 
-                        `repeat(${value}, 1fr)`;
-                });
-
-                // Handle sort toggle
-                let sortNewestFirst = true;
-                const sortButton = document.getElementById('sort-toggle');
-                const sortedFiles = [...files];
-
-                // Fuzzy search function
-                function fuzzyMatch(str, pattern) {
-                    pattern = pattern.toLowerCase();
-                    str = str.toLowerCase();
-                    
-                    let patternIdx = 0;
-                    let strIdx = 0;
-                    
-                    while (patternIdx < pattern.length && strIdx < str.length) {
-                        if (pattern[patternIdx] === str[strIdx]) {
-                            patternIdx++;
-                        }
-                        strIdx++;
+                // Get dimensions for all images in the gallery
+                await Promise.all(items.map(async (item) => {
+                    if (!item.width || !item.height) {
+                        const dimensions = await getImageDimensions(item.src);
+                        item.width = dimensions.width;
+                        item.height = dimensions.height;
                     }
-                    
-                    return patternIdx === pattern.length;
-                }
+                }));
+            });
 
-                function updateSelectionCount() {
-                    const selected = document.querySelectorAll('.item-checkbox:checked').length;
-                    const total = files.length;
-                    selectedCountSpan.textContent = selected;
-                    totalCountSpan.textContent = total;
-                    selectAllBtn.textContent = selected === total ? 'Deselect All' : 'Select All';
-                }
-
-                function updateGallery() {
-                    const gallery = document.getElementById('gallery');
-                    gallery.innerHTML = '';
-                    
-                    const searchTerm = searchInput.value.trim();
-                    
-                    sortedFiles.forEach((file, index) => {
-                        // Apply search filter
-                        if (searchTerm && !fuzzyMatch(file.name, searchTerm)) {
-                            return;
-                        }
-                        
-                        const itemDiv = document.createElement('div');
-                        itemDiv.className = 'item';
-                        
-                        const checkbox = document.createElement('input');
-                        checkbox.type = 'checkbox';
-                        checkbox.className = 'item-checkbox';
-                        checkbox.dataset.index = index;
-                        checkbox.addEventListener('change', updateSelectionCount);
-                        
-                        const link = document.createElement('a');
-                        link.href = file.path;
-                        
-                        let element;
-                        if (file.type.startsWith('video/')) {
-                            element = document.createElement('video');
-                            element.controls = true;
-                            element.preload = 'metadata';
-                        } else if (file.type.startsWith('audio/')) {
-                            element = document.createElement('audio');
-                            element.controls = true;
-                            element.preload = 'metadata';
-                        } else {
-                            element = document.createElement('img');
-                        }
-                        
-                        element.src = file.path;
-                        element.alt = file.name;
-                        
-                        const typeLabel = document.createElement('div');
-                        typeLabel.className = 'media-type';
-                        typeLabel.textContent = file.type.split('/')[0].toUpperCase();
-                        
-                        const tooltip = document.createElement('div');
-                        tooltip.className = 'filename-tooltip';
-                        tooltip.textContent = file.name;
-                        
-                        itemDiv.appendChild(checkbox);
-                        link.appendChild(element);
-                        itemDiv.appendChild(link);
-                        itemDiv.appendChild(typeLabel);
-                        itemDiv.appendChild(tooltip);
-                        gallery.appendChild(itemDiv);
-                        
-                        if (file.type.startsWith('image/')) {
-                            link.dataset.pswpWidth = 1200;
-                            link.dataset.pswpHeight = 800;
-                            
-                            element.onload = function() {
-                                link.dataset.pswpWidth = this.naturalWidth;
-                                link.dataset.pswpHeight = this.naturalHeight;
-                            };
-                        }
-                    });
-
-                    updateSelectionCount();
-                }
-
-                // Handle search input
-                searchInput.addEventListener('input', updateGallery);
-
-                // Handle select all
-                selectAllBtn.addEventListener('click', function() {
-                    const checkboxes = document.querySelectorAll('.item-checkbox');
-                    const allChecked = Array.from(checkboxes).every(cb => cb.checked);
-                    checkboxes.forEach(cb => cb.checked = !allChecked);
-                    updateSelectionCount();
-                });
-
-                sortButton.addEventListener('click', function() {
-                    sortNewestFirst = !sortNewestFirst;
-                    sortButton.textContent = `Sort: ${sortNewestFirst ? 'Newest' : 'Oldest'} First`;
-                    
-                    sortedFiles.sort((a, b) => {
-                        return sortNewestFirst ? 
-                            b.mtime - a.mtime : 
-                            a.mtime - b.mtime;
-                    });
-                    
-                    updateGallery();
-                });
-
-                // Initial gallery setup
-                updateGallery();
-
-                // Set initial column count
-                document.querySelector('.gallery').style.gridTemplateColumns = 'repeat(2, 1fr)';
-
-                console.log('Gallery initialization complete');
-            } catch (error) {
-                console.error('Error initializing gallery:', error);
-                document.body.innerHTML += `
-                    <div style="color: red; padding: 20px; background: rgba(255,0,0,0.1); border: 1px solid red; margin: 20px;">
-                        <h3>Error loading gallery</h3>
-                        <pre>${error.stack || error.message}</pre>
-                    </div>`;
-            }
-        }
-
-        // Initialize gallery when DOM is ready
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', initGallery);
-        } else {
-            initGallery();
-        }
+            lightbox.init();
+            
+            // Initialize columns for each tab
+            {% for tab in tabs %}
+            updateColumns('{{ tab }}');
+            {% endfor %}
+        });
     </script>
 </body>
-</html>
-'''
+</html>'''
 
 def is_media_file(file_path):
     """Check if file is an image, video, or audio file."""
@@ -501,183 +572,179 @@ def get_base64_data(file_path, mime_type):
         data = base64.b64encode(f.read()).decode('utf-8')
     return f'data:{mime_type};base64,{data}'
 
-def create_download_handler(media_dir):
-    """Create a download handler for selected files"""
-    def download_handler(environ, start_response):
-        try:
-            # Get the POST data
-            content_length = int(environ.get('CONTENT_LENGTH', 0))
-            post_data = environ['wsgi.input'].read(content_length).decode('utf-8')
-            
-            # Parse the form data
-            import urllib.parse
-            post_dict = urllib.parse.parse_qs(post_data)
-            selected_files = json.loads(post_dict['files'][0])
-            
-            # Create a temporary ZIP file
-            zip_path = media_dir / 'selected_files.zip'
-            with zipfile.ZipFile(zip_path, 'w') as zf:
-                for file in selected_files:
-                    file_path = media_dir / file['name']
-                    if file_path.exists():
-                        zf.write(file_path, file['name'])
-            
-            # Send the ZIP file
-            with open(zip_path, 'rb') as f:
-                file_content = f.read()
-            
-            headers = [
-                ('Content-Type', 'application/zip'),
-                ('Content-Disposition', 'attachment; filename="selected_files.zip"'),
-                ('Content-Length', str(len(file_content)))
-            ]
-            
-            start_response('200 OK', headers)
-            return [file_content]
-            
-        except Exception as e:
-            start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
-            return [str(e).encode()]
-        
-        finally:
-            # Clean up the temporary ZIP file
-            if zip_path.exists():
-                zip_path.unlink()
-    
-    return download_handler
-
-def serve_gallery(gallery_dir):
-    """Serve the gallery using a simple HTTP server"""
-    from wsgiref.simple_server import make_server
-    import urllib.parse
-    
-    def application(environ, start_response):
-        path = environ.get('PATH_INFO', '').lstrip('/')
-        
-        if environ['REQUEST_METHOD'] == 'POST' and path == 'download':
-            return download_handler(environ, start_response)
-        
-        if not path or path == 'index.html':
-            file_path = gallery_dir / 'index.html'
-        else:
-            file_path = gallery_dir / path
-        
-        if not file_path.exists():
-            start_response('404 Not Found', [('Content-Type', 'text/plain')])
-            return [b'File not found']
-        
-        content_type = mimetypes.guess_type(str(file_path))[0] or 'application/octet-stream'
-        
-        with open(file_path, 'rb') as f:
-            file_content = f.read()
-        
-        start_response('200 OK', [('Content-Type', content_type)])
-        return [file_content]
-    
-    port = 8000
-    httpd = make_server('', port, application)
-    print(f"\nServing gallery at http://localhost:{port}")
-    print("Press Ctrl+C to stop the server")
-    
-    return httpd
-
 def main():
     args = parse_args()
     
-    # Initialize mimetypes
-    mimetypes.init()
+    # Create directory with timestamp (without seconds)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    gallery_dir = Path(f'imgshare_{timestamp}')
+    gallery_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get current directory and resolve any symlinks
-    current_dir = Path.cwd().resolve()
-    print("Creating gallery...")
-    
-    # Create timestamp for new directory
-    timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M')
-    new_dir_name = f'imgshare_{timestamp}'
-    new_dir = current_dir / new_dir_name
-    media_dir = new_dir / 'media'
-    
-    # Create directories
+    # Create media directory
+    media_dir = gallery_dir / 'media'
     media_dir.mkdir(parents=True, exist_ok=True)
     
-    # Find and process media files
-    media_files = []
-    for file in current_dir.iterdir():
-        if file.is_file() and is_media_file(str(file)):
-            # Copy file to media directory
-            shutil.copy2(file, media_dir)
-            
-            # Get mime type and file stats
-            mime_type, _ = mimetypes.guess_type(str(file))
-            mime_type = mime_type or 'application/octet-stream'
-            mtime = os.path.getmtime(file)
-            
-            # Add to media files list with relative path
-            media_files.append({
-                'name': file.name,
-                'type': mime_type,
-                'path': f'media/{file.name}',  # Relative path from index.html
-                'mtime': mtime  # Add modification time for sorting
-            })
+    # Set up search depth
+    recursive = args.recursive
+    max_depth = args.depth if args.depth is not None else (float('inf') if recursive else 1)
     
-    if not media_files:
-        print("No media files found in current directory!")
+    # Organize files by tabs if patterns are provided
+    if args.tabs:
+        tab_files = organize_files_by_tabs(os.getcwd(), args.tabs, recursive, max_depth)
+    else:
+        # If no tabs specified, just use 'all' tab
+        tab_files = {'all': []}
+        
+        def collect_files(dir_path, current_depth=1):
+            try:
+                with os.scandir(dir_path) as entries:
+                    for entry in entries:
+                        if entry.is_file() and is_media_file(entry.name):
+                            tab_files['all'].append(entry.path)
+                        elif entry.is_dir() and (recursive or current_depth < max_depth):
+                            collect_files(entry.path, current_depth + 1)
+            except PermissionError:
+                print(f"Warning: Permission denied accessing {dir_path}")
+            except Exception as e:
+                print(f"Warning: Error processing {dir_path}: {e}")
+        
+        collect_files(os.getcwd())
+    
+    if not tab_files['all']:
+        print("No media files found!")
         sys.exit(1)
     
-    # Sort files by modification time (newest first)
-    media_files.sort(key=lambda x: x['mtime'], reverse=True)
+    # Create subdirectories for each tab (except 'all') and copy files
+    for tab_name, files in tab_files.items():
+        if tab_name != 'all':  # Skip creating directory for 'all' tab
+            tab_dir = media_dir / tab_name
+            tab_dir.mkdir(parents=True, exist_ok=True)
+            for file in files:
+                dest = tab_dir / Path(file).name
+                if os.path.exists(file) and not os.path.exists(dest):
+                    shutil.copy2(file, dest)
     
-    # Generate the files list for HTML
-    files_json = ',\n        '.join(
-        f"{{ name: '{f['name'].replace("'", "\\'")}', type: '{f['type']}', path: '{f['path']}', mtime: {f['mtime']} }}"
-        for f in media_files
-    )
+    # Generate HTML for each tab
+    galleries = {}
+    tab_counts = {}
+    for tab_name, files in tab_files.items():
+        if tab_name == 'all':
+            galleries[tab_name] = generate_gallery_html(media_dir, tab_name, is_all_tab=True)
+        else:
+            tab_dir = media_dir / tab_name
+            galleries[tab_name] = generate_gallery_html(tab_dir, tab_name)
+        tab_counts[tab_name] = len(files)
     
-    # Create index.html
-    html_content = HTML_TEMPLATE.replace('/*FILES_PLACEHOLDER*/', files_json)
-    index_path = new_dir / 'index.html'
+    # Create tab buttons HTML
+    tab_buttons = []
+    for tab in tab_files.keys():
+        tab_buttons.append(f'<button class="tab" onclick="showTab(\'{tab}\')">{tab} ({tab_counts[tab]})</button>')
     
-    with open(index_path, 'w', encoding='utf-8') as f:
-        f.write(html_content)
+    # Create gallery containers HTML
+    gallery_containers = []
+    for tab in tab_files.keys():
+        is_first = tab == list(tab_files.keys())[0]
+        container = f'''
+        <div id="{tab}-gallery" class="gallery-container{' active' if is_first else ''}">
+            <div class="controls">
+                <label>
+                    Columns: <span id="{tab}-columns-value">2</span>
+                    <input type="range" min="1" max="8" value="2" id="{tab}-columns" onchange="updateColumns(\'{tab}\')">
+                </label>
+                <div class="search-container">
+                    <input type="text" id="{tab}-search" placeholder="Search files..." onkeyup="filterItems(\'{tab}\')">
+                    <button class="clear-button" onclick="clearSearch(\'{tab}\')">Clear</button>
+                </div>
+            </div>
+            <div class="gallery" id="{tab}-grid">
+                {galleries[tab]}
+            </div>
+        </div>'''
+        gallery_containers.append(container)
     
-    # Count media types
+    # Initialize JavaScript for each tab
+    init_js = []
+    for tab in tab_files.keys():
+        init_js.append(f'updateColumns(\'{tab}\');')
+    
+    # Create the gallery HTML
+    gallery_html = HTML_TEMPLATE
+    
+    # Replace template variables
+    replacements = {
+        '<div class="tabs">\n        {% for tab in tabs %}\n        <button class="tab" onclick="showTab(\'{{ tab }}\')">{{ tab }} ({{ tab_counts[tab] }})</button>\n        {% endfor %}\n    </div>': 
+            f'<div class="tabs">\n        {" ".join(tab_buttons)}\n    </div>',
+        
+        '{% for tab in tabs %}\n    <div id="{{ tab }}-gallery" class="gallery-container {% if loop.first %}active{% endif %}">\n        <div class="controls">\n            <label>\n                Columns: <span id="{{ tab }}-columns-value">2</span>\n                <input type="range" min="1" max="8" value="2" id="{{ tab }}-columns" onchange="updateColumns(\'{{ tab }}\')">\n            </label>\n            <div class="search-container">\n                <input type="text" id="{{ tab }}-search" placeholder="Search files..." onkeyup="filterItems(\'{{ tab }}\')">\n                <button class="clear-button" onclick="clearSearch(\'{{ tab }}\')">Clear</button>\n            </div>\n        </div>\n        <div class="gallery" id="{{ tab }}-grid">\n            {{ galleries[tab] }}\n        </div>\n    </div>\n    {% endfor %}':
+            '\n'.join(gallery_containers),
+        
+        '{% for tab in tabs %}\n            updateColumns(\'{{ tab }}\');\n            {% endfor %}':
+            '\n            '.join(init_js)
+    }
+    
+    for template, replacement in replacements.items():
+        gallery_html = gallery_html.replace(template, replacement)
+    
+    # Write the gallery HTML file
+    gallery_path = gallery_dir / 'index.html'
+    with open(gallery_path, 'w', encoding='utf-8') as f:
+        f.write(gallery_html)
+    
+    # Count media types and unique files
     media_types = {}
-    for f in media_files:
-        media_type = f['type'].split('/')[0]
-        media_types[media_type] = media_types.get(media_type, 0) + 1
+    unique_files = set()  # Track unique files by their full path
+    for tab_name, files in tab_files.items():
+        if tab_name != 'all':  # Don't count 'all' tab to avoid double counting
+            for f in files:
+                unique_files.add(f)  # Add to set of unique files
+                ext = Path(f).suffix.lower()[1:]  # Remove the dot
+                if ext:
+                    media_types[ext] = media_types.get(ext, 0) + 1
     
     # Print summary
     print("\nGallery created successfully!")
-    print(f"Location: {new_dir}")
-    print(f"Total files: {len(media_files)}")
+    print(f"Location: {gallery_dir}")
+    print(f"Total unique files: {len(unique_files)}")
     print("Media types:")
     for media_type, count in media_types.items():
-        print(f"  - {media_type}: {count}")
+        print(f"  {media_type}: {count}")
     
+    # Create ZIP archive if requested
+    if args.zip:
+        zip_path = gallery_dir.with_suffix('.zip')
+        print(f"\nCreating ZIP archive: {zip_path}")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(gallery_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    arcname = file_path.relative_to(gallery_dir)
+                    zipf.write(file_path, arcname)
+        print("ZIP archive created successfully!")
+    
+    # Open in browser if requested
     if not args.no_browser:
-        # Handle path conversion for WSL
-        if is_wsl():
-            # Wait a moment for files to be written
-            time.sleep(0.5)
+        if is_wsl() or platform.system() == 'Windows':
+            time.sleep(0.5)  # Small delay to ensure files are written
             
-            windows_path = convert_wsl_path_to_windows(index_path)
-            if windows_path:
-                print("\nOpening gallery in Windows Explorer...")
-                try:
-                    # Use explorer.exe to open the file in Windows
-                    subprocess.run(['explorer.exe', windows_path], check=True)
-                except Exception as e:
-                    print(f"\nFailed to open Windows Explorer: {e}")
-                    print(f"Please manually open this file: {windows_path}")
+            if is_wsl():
+                windows_path = convert_wsl_path_to_windows(gallery_path)
+                if windows_path:
+                    path_to_open = windows_path
+                else:
+                    print("\nWarning: Could not convert WSL path to Windows path.")
+                    print(f"Please manually open: {gallery_path}")
+                    return
             else:
-                print("\nWarning: Could not convert WSL path to Windows path.")
-                print(f"Please manually open: {index_path}")
+                path_to_open = str(gallery_path.absolute())
+            
+            try:
+                subprocess.run(['explorer.exe', path_to_open])
+            except Exception as e:
+                print(f"\nFailed to open Windows Explorer: {e}")
+                print(f"Please manually open this file: {path_to_open}")
         else:
-            print("\nOpening gallery in your default browser...")
-            file_url = index_path.absolute().as_uri()
-            webbrowser.open(file_url)
-    else:
-        print("\nUse --no-browser flag to prevent automatic browser opening")
+            # For non-Windows systems, use the default browser
+            webbrowser.open(gallery_path.absolute().as_uri())
 
 if __name__ == '__main__':
     main() 
