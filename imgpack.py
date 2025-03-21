@@ -20,6 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Create an image gallery from the current directory.')
     parser.add_argument('--no-browser', action='store_true', help='Do not automatically open the gallery in a browser')
     parser.add_argument('--tabs', nargs='+', help='Create tabs based on patterns (e.g., --tabs lora banny .mp4)')
+    parser.add_argument('--all', action='store_true', help='Include an "all" tab containing all media files')
     parser.add_argument('--zip', action='store_true', help='Create a ZIP archive of the gallery')
     parser.add_argument('-r', '--recursive', action='store_true', help='Search recursively in subdirectories')
     parser.add_argument('--depth', type=int, help='Maximum directory depth to search (default: 1, or unlimited if recursive)')
@@ -79,9 +80,9 @@ def matches_pattern(filename, pattern):
     """Check if filename matches the pattern case-insensitively"""
     return pattern.lower() in filename.lower()
 
-def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1):
+def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1, include_unmatched=False):
     """Organize files into tabs based on patterns"""
-    tab_files = {'all': []}  # Always include 'all' tab
+    tab_files = {'all': []}  # 'all' tab will contain everything we collect
     
     def process_directory(dir_path, current_depth=1):
         try:
@@ -91,10 +92,7 @@ def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1):
                         if not is_media_file(entry.name):
                             continue
                             
-                        # Add to 'all' tab first
-                        tab_files['all'].append(entry.path)
-                        
-                        # Then check patterns
+                        # Check if file matches any pattern
                         matched = False
                         for pattern in patterns:
                             if matches_pattern(entry.name, pattern):
@@ -103,10 +101,9 @@ def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1):
                                 tab_files[pattern].append(entry.path)
                                 matched = True
                         
-                        if not matched:
-                            if 'other' not in tab_files:
-                                tab_files['other'] = []
-                            tab_files['other'].append(entry.path)
+                        # Add to 'all' tab if it matched any pattern or if we're including unmatched files
+                        if matched or include_unmatched:
+                            tab_files['all'].append(entry.path)
                     
                     elif entry.is_dir() and (recursive or current_depth < max_depth):
                         if recursive or current_depth < max_depth:
@@ -117,8 +114,8 @@ def organize_files_by_tabs(directory, patterns, recursive=False, max_depth=1):
             print(f"Warning: Error processing {dir_path}: {e}")
     
     process_directory(directory)
-    # Only return tabs that have files, but always include 'all'
-    return {k: v for k, v in tab_files.items() if v or k == 'all'}
+    # Return all tabs that have files
+    return {k: v for k, v in tab_files.items() if v}
 
 def generate_gallery_html(directory, tab_name, is_all_tab=False):
     """Generate HTML for a gallery of media files in the given directory"""
@@ -301,7 +298,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .gallery .item img {
             width: 100%;
             height: auto;
-            min-height: 150px; /* Minimum height to ensure visibility */
+            min-height: 150px;
             display: block;
             cursor: zoom-in;
             transition: transform 0.2s;
@@ -312,17 +309,63 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .gallery .item audio {
             width: 100%;
             height: auto;
-            min-height: 150px; /* Minimum height for videos */
             display: block;
-            cursor: pointer;
             transition: transform 0.2s;
             object-fit: contain;
         }
         
+        .gallery .item video {
+            min-height: 150px;
+        }
+
         .gallery .item audio {
-            min-height: 50px; /* Smaller minimum height for audio controls */
-            padding: 30px;
+            min-height: 40px;
+            margin: 10px;
+            width: calc(100% - 20px);
+            background: #444;
+            border-radius: 4px;
+            padding: 10px;
             box-sizing: border-box;
+        }
+
+        /* Audio player specific styles */
+        .gallery .item audio::-webkit-media-controls {
+            background-color: #444;
+        }
+
+        .gallery .item audio::-webkit-media-controls-panel {
+            background-color: #444;
+            border-radius: 4px;
+        }
+
+        .gallery .item audio::-webkit-media-controls-play-button,
+        .gallery .item audio::-webkit-media-controls-mute-button {
+            background-color: #555;
+            border-radius: 50%;
+            transition: background-color 0.2s;
+        }
+
+        .gallery .item audio::-webkit-media-controls-play-button:hover,
+        .gallery .item audio::-webkit-media-controls-mute-button:hover {
+            background-color: #666;
+        }
+
+        .gallery .item audio::-webkit-media-controls-current-time-display,
+        .gallery .item audio::-webkit-media-controls-time-remaining-display {
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
+
+        .gallery .item audio::-webkit-media-controls-timeline {
+            background-color: #555;
+            border-radius: 2px;
+            height: 4px;
+        }
+
+        .gallery .item audio::-webkit-media-controls-volume-slider {
+            background-color: #555;
+            border-radius: 2px;
+            height: 4px;
         }
         
         .gallery .item:hover img,
@@ -590,7 +633,7 @@ def main():
     
     # Organize files by tabs if patterns are provided
     if args.tabs:
-        tab_files = organize_files_by_tabs(os.getcwd(), args.tabs, recursive, max_depth)
+        tab_files = organize_files_by_tabs(os.getcwd(), args.tabs, recursive, max_depth, include_unmatched=args.all)
     else:
         # If no tabs specified, just use 'all' tab
         tab_files = {'all': []}
@@ -610,19 +653,18 @@ def main():
         
         collect_files(os.getcwd())
     
-    if not tab_files['all']:
+    if not tab_files:
         print("No media files found!")
         sys.exit(1)
     
-    # Create subdirectories for each tab (except 'all') and copy files
+    # Create subdirectories for each tab and copy files
     for tab_name, files in tab_files.items():
-        if tab_name != 'all':  # Skip creating directory for 'all' tab
-            tab_dir = media_dir / tab_name
-            tab_dir.mkdir(parents=True, exist_ok=True)
-            for file in files:
-                dest = tab_dir / Path(file).name
-                if os.path.exists(file) and not os.path.exists(dest):
-                    shutil.copy2(file, dest)
+        tab_dir = media_dir / tab_name
+        tab_dir.mkdir(parents=True, exist_ok=True)
+        for file in files:
+            dest = tab_dir / Path(file).name
+            if os.path.exists(file) and not os.path.exists(dest):
+                shutil.copy2(file, dest)
     
     # Generate HTML for each tab
     galleries = {}
