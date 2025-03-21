@@ -1,0 +1,7 @@
+# Common files to ignore
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.DS_Store
