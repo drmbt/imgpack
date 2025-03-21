@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument('--zip', action='store_true', help='Create a ZIP archive of the gallery')
     parser.add_argument('-r', '--recursive', action='store_true', help='Search recursively in subdirectories')
     parser.add_argument('--depth', type=int, help='Maximum directory depth to search (default: 1, or unlimited if recursive)')
+    parser.add_argument('--compress', action='store_true', 
+                       help='Compress media files during copy (requires Pillow and ffmpeg-python)')
     return parser.parse_args()
 
 def is_wsl():
@@ -615,6 +617,70 @@ def get_base64_data(file_path, mime_type):
         data = base64.b64encode(f.read()).decode('utf-8')
     return f'data:{mime_type};base64,{data}'
 
+def compress_media_file(source_path, dest_path):
+    """Compress media file based on its type"""
+    mime_type, _ = mimetypes.guess_type(source_path)
+    if not mime_type:
+        return shutil.copy2(source_path, dest_path)  # Fallback to direct copy
+        
+    media_type = mime_type.split('/')[0]
+    
+    try:
+        if media_type == 'image':
+            from PIL import Image
+            
+            # Open image and convert to RGB if needed
+            with Image.open(source_path) as img:
+                # Convert RGBA to RGB with white background
+                if img.mode == 'RGBA':
+                    background = Image.new('RGB', img.size, 'white')
+                    background.paste(img, mask=img.split()[3])
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Compute new size while maintaining aspect ratio
+                max_size = (1920, 1080)  # Full HD resolution
+                img.thumbnail(max_size, Image.Resampling.LANCZOS)
+                
+                # Save with optimized settings
+                img.save(dest_path, 'JPEG', quality=85, optimize=True)
+                
+        elif media_type == 'video':
+            import ffmpeg
+            
+            # Compress video using H.264 codec
+            stream = ffmpeg.input(source_path)
+            stream = ffmpeg.output(stream, dest_path,
+                                 vcodec='libx264',
+                                 acodec='aac',
+                                 preset='medium',
+                                 crf=23,  # Constant Rate Factor (18-28, lower is better quality)
+                                 audio_bitrate='128k',
+                                 vf='scale=\'min(1920,iw)\':\'min(1080,ih)\':force_original_aspect_ratio=decrease')
+            ffmpeg.run(stream, overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            
+        elif media_type == 'audio':
+            import ffmpeg
+            
+            # Compress audio using AAC codec
+            stream = ffmpeg.input(source_path)
+            stream = ffmpeg.output(stream, dest_path,
+                                 acodec='aac',
+                                 audio_bitrate='128k')
+            ffmpeg.run(stream, overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            
+        else:
+            # For unsupported types, just copy
+            shutil.copy2(source_path, dest_path)
+            
+    except ImportError as e:
+        print(f"Warning: Compression requires additional packages ({e}). Copying file without compression...")
+        shutil.copy2(source_path, dest_path)
+    except Exception as e:
+        print(f"Warning: Failed to compress {source_path}: {e}")
+        shutil.copy2(source_path, dest_path)
+
 def main():
     args = parse_args()
     
@@ -657,14 +723,17 @@ def main():
         print("No media files found!")
         sys.exit(1)
     
-    # Create subdirectories for each tab and copy files
+    # Create subdirectories for each tab and copy/compress files
     for tab_name, files in tab_files.items():
         tab_dir = media_dir / tab_name
         tab_dir.mkdir(parents=True, exist_ok=True)
         for file in files:
             dest = tab_dir / Path(file).name
             if os.path.exists(file) and not os.path.exists(dest):
-                shutil.copy2(file, dest)
+                if args.compress:
+                    compress_media_file(file, dest)
+                else:
+                    shutil.copy2(file, dest)
     
     # Generate HTML for each tab
     galleries = {}
