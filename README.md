@@ -1,6 +1,6 @@
 # imgpack
 
-A powerful media organization and sharing tool that creates beautiful web galleries from your media files.
+A media organization cli tool that creates filtered web galleries from your media files.
 
 ![imgpack gallery screenshot](/assets/screenshot.png)
 
